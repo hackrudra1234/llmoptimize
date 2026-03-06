@@ -298,9 +298,20 @@ def print_savings_celebration(savings):
         time.sleep(0.5)
 
 
+def _is_jupyter() -> bool:
+    """Return True if running inside a Jupyter / IPython kernel."""
+    try:
+        from IPython import get_ipython
+        ip = get_ipython()
+        return ip is not None and hasattr(ip, "kernel")
+    except Exception:
+        return False
+
+
 def interactive_prompt():
     # Skip prompt when stdout is not a real terminal (scripts, CI, pipes)
-    if not sys.stdout.isatty():
+    # Exception: Jupyter kernels have no tty but do support input()
+    if not sys.stdout.isatty() and not _is_jupyter():
         return "4"
     print(f"\n{Colors.BOLD}What would you like to do?{Colors.END}\n")
     print(f"  {Colors.CYAN}[1]{Colors.END} 📊 Open full interactive report in browser")
@@ -497,11 +508,7 @@ class LLMOptimize:
                         "is_embedding":  model_is_embedding,
                         "is_reasoning":  model_is_reasoning,
                         "tier_drop":     tier_drop,
-                        "reason": (
-                            f"{quality_note}. "
-                            f"{alt_model} is {pct}% cheaper at ~{avg_in} tokens/call "
-                            f"(saves ${saving_per_1k:.4f} per 1,000 calls)"
-                        ),
+                        "reason": quality_note,
                     })
 
             recommendations = sorted(all_candidates, key=lambda x: -x["savings_pct"])[:3]
@@ -617,6 +624,93 @@ class LLMOptimize:
             }
 
         except Exception:
+            pass
+
+        # Fallback: read from llmoptimize.patcher local session
+        # (used when server package not installed — e.g. pip install llmoptimize)
+        try:
+            from llmoptimize.patcher import get_local_session, _calculate_cost, _ALTERNATIVES, _is_embedding
+            session = get_local_session()
+            if not session.calls:
+                return {}
+
+            total_calls = len(session.calls)
+            total_cost  = session.total_cost
+
+            model_agg = {}
+            for call in session.calls:
+                m = call.model
+                if m not in model_agg:
+                    model_agg[m] = {"count": 0, "prompt_tokens": 0, "completion_tokens": 0}
+                model_agg[m]["count"]             += 1
+                model_agg[m]["prompt_tokens"]     += call.prompt_tokens
+                model_agg[m]["completion_tokens"] += call.completion_tokens
+
+            recommendations = []
+            seen = set()
+            for model, stats in sorted(model_agg.items(), key=lambda x: -x[1]["count"])[:3]:
+                count   = stats["count"]
+                avg_in  = max(1, stats["prompt_tokens"]  // count)
+                avg_out = stats["completion_tokens"] // count
+                cur_c   = _calculate_cost(model, avg_in, avg_out)
+                alts    = _ALTERNATIVES.get(model, [])
+                if isinstance(alts, str):
+                    alts = [alts]
+                for alt in alts:
+                    if alt in seen:
+                        continue
+                    seen.add(alt)
+                    alt_c = _calculate_cost(alt, avg_in, avg_out)
+                    if alt_c < cur_c:
+                        pct = int((cur_c - alt_c) / cur_c * 100)
+                        recommendations.append({
+                            "model":         alt,
+                            "from_model":    model,
+                            "savings_pct":   pct,
+                            "savings_text":  f"{pct}%",
+                            "avg_in":        avg_in,
+                            "avg_out":       avg_out,
+                            "call_count":    count,
+                            "saving_per_1k": round((cur_c - alt_c) * 1000, 6),
+                            "is_embedding":  _is_embedding(model),
+                            "reason":        "Similar capability tier at a lower price point",
+                        })
+
+            categories = {}
+            for model, stats in model_agg.items():
+                count   = stats["count"]
+                avg_in  = max(1, stats["prompt_tokens"] // count)
+                avg_out = stats["completion_tokens"] // count
+                cost    = _calculate_cost(model, avg_in, avg_out) * count
+                cat     = "embedding" if _is_embedding(model) else "chat"
+                entry   = categories.setdefault(cat, {"calls": 0, "cost": 0.0, "models": []})
+                entry["calls"] += count
+                entry["cost"]   = round(entry["cost"] + cost, 6)
+                if model not in entry["models"]:
+                    entry["models"].append(model)
+            for cat, entry in categories.items():
+                best = next((r for r in recommendations
+                             if (cat == "embedding") == r.get("is_embedding", False)), None)
+                entry["best_alt"] = best["model"]       if best else None
+                entry["best_pct"] = best["savings_pct"] if best else 0
+
+            total_savings   = sum(
+                max(0, _calculate_cost(r["from_model"], r["avg_in"], r["avg_out"])
+                    - _calculate_cost(r["model"], r["avg_in"], r["avg_out"]))
+                for r in recommendations
+            )
+            total_savings   = max(0.0, min(total_savings, total_cost))
+            avg_savings_pct = int(total_savings / total_cost * 100) if total_cost > 0 else 0
+
+            return {
+                "total_calls":     total_calls,
+                "total_cost":      round(total_cost, 4),
+                "total_savings":   round(total_savings, 4),
+                "avg_savings_pct": avg_savings_pct,
+                "recommendations": recommendations,
+                "categories":      categories,
+            }
+        except Exception:
             return {}
 
     def _show_interactive_report(self, data, task_name: str = ""):
@@ -685,7 +779,11 @@ class LLMOptimize:
         # Decide which group is primary based on what the session mostly used
         # If ALL top-model recs are embedding → only show embedding section
         all_recs = embedding_recs or chat_recs
-        if embedding_recs and chat_recs:
+        if not all_recs:
+            print(f"{Colors.GREEN}{Colors.BOLD}✅  Already using optimized models!{Colors.END}")
+            print(f"   No cheaper alternatives found for your current setup.")
+            print(f"   You're already getting great cost efficiency. Keep it up!")
+        elif embedding_recs and chat_recs:
             # Mixed session — show both sections with headers
             print(f"{Colors.BOLD}── Embedding Models ──{Colors.END}")
             for i, rec in enumerate(embedding_recs[:2], 1):
@@ -697,6 +795,116 @@ class LLMOptimize:
             for i, rec in enumerate(all_recs[:3], 1):
                 print_recommendation_card(i, rec)
 
+        print_divider()
+
+        # ── Loop detection results ─────────────────────────────────────────
+        loop = data.get("loop_analysis")
+        if loop and loop.get("detected"):
+            print(f"\n{Colors.BOLD}{Colors.YELLOW}🔁  LOOP DETECTED{Colors.END}")
+            print(f"   {loop.get('message', '')}")
+            print(f"   💡 Tip: Add a stop condition or limit to your agent loop.")
+            print_divider()
+
+        # ── RAG analysis results ───────────────────────────────────────────
+        rag = data.get("rag_analysis")
+        if rag and rag.get("is_rag_application"):
+            savings_rag = rag.get("estimated_monthly_savings", 0)
+            print(f"\n{Colors.BOLD}{Colors.CYAN}📚  RAG PATTERN DETECTED{Colors.END}")
+            print(f"   Confidence: {int(rag.get('confidence', 0) * 100)}%")
+            for ev in rag.get("evidence", [])[:2]:
+                print(f"   • {ev}")
+            opps    = rag.get("optimization_opportunities", {})
+            emb_opp = opps.get("embedding")
+            llm_opp = opps.get("llm")
+            if emb_opp:
+                print(f"\n   💰 Embedding savings: ${emb_opp.get('monthly_savings', 0):.4f}/month")
+                print(f"   → {emb_opp.get('action', '')}")
+            if llm_opp:
+                print(f"\n   💰 LLM savings: ${llm_opp.get('monthly_savings', 0):.4f}/month")
+                print(f"   → {llm_opp.get('action', '')}")
+            if savings_rag > 0:
+                print(f"\n   {Colors.GREEN}{Colors.BOLD}Total RAG savings potential: ${savings_rag:.4f}/month{Colors.END}")
+            print_divider()
+
+        # ── Guardrail summary ──────────────────────────────────────────────
+        guard = data.get("guardrail_summary")
+        if guard and guard.get("issues_detected"):
+            print(f"\n{Colors.BOLD}{Colors.RED}🛡️  SECURITY NOTICE{Colors.END}")
+            print(f"   {guard.get('message', '')}")
+            print(f"   💡 Review your prompts for sensitive data before sending to AI APIs.")
+            print_divider()
+
+        # ── Agent workflow insights ────────────────────────────────────────
+        agent = data.get("agent_insights")
+        if agent:
+            print(f"\n{Colors.BOLD}{Colors.BLUE}🤖  AGENT WORKFLOW ANALYSIS{Colors.END}")
+            print(f"   Steps tracked:        {agent.get('step_count', 0)}")
+            print(f"   Models used:          {agent.get('unique_models_used', 1)}"
+                  + (" (multi-model workflow)" if agent.get("is_multi_model") else ""))
+            print(f"   Avg tokens/step:      {agent.get('avg_tokens_per_step', 0):,}")
+            print(f"   Context growth:       {agent.get('context_growth_ratio', 1.0)}x")
+            most_exp = agent.get("most_expensive_step")
+            if most_exp:
+                print(f"   Most expensive step:  {most_exp['model']} — ${most_exp['cost']:.6f}")
+            tips = agent.get("optimization_tips", [])
+            if tips:
+                print(f"\n   {Colors.YELLOW}💡 Optimization tips:{Colors.END}")
+                for tip in tips:
+                    print(f"   • {tip}")
+            print_divider()
+
+        # ── Cache insights ─────────────────────────────────────────────────
+        cache = data.get("cache_insights")
+        if cache:
+            print(f"\n{Colors.BOLD}{Colors.CYAN}⚡  CACHING OPPORTUNITIES{Colors.END}")
+            print(f"   {cache.get('message', '')}")
+            top = cache.get("top_cacheable_categories", [])
+            if top:
+                print(f"\n   Repeated prompt categories:")
+                for entry in top:
+                    print(f"   • {entry['category']:20}  {entry['calls']} calls  "
+                          f"${entry['cost']:.4f}")
+            print(f"\n   💡 Use OpenAI Prompt Caching or a semantic cache layer to")
+            print(f"      avoid re-sending identical prompts to the API.")
+            print_divider()
+
+        # ── ML training insights ───────────────────────────────────────────
+        ml = data.get("ml_insights")
+        if ml:
+            print(f"\n{Colors.BOLD}{Colors.PURPLE}🧠  ML MODEL STATUS{Colors.END}")
+            print(f"   {ml.get('message', '')}")
+            print(f"   {ml.get('recommendation', '')}")
+            acc = ml.get("accuracy")
+            if acc:
+                print(f"   Current accuracy: {int(acc * 100)}%")
+            print_divider()
+
+        # ── Context optimizer insights ─────────────────────────────────────
+        opt = data.get("optimizer_insights")
+        if opt:
+            print(f"\n{Colors.BOLD}{Colors.GREEN}📏  CONTEXT WINDOW OPTIMIZER{Colors.END}")
+            print(f"   {opt.get('message', '')}")
+            print(f"   Max prompt seen:  {opt.get('max_prompt_tokens', 0):,} tokens")
+            if opt.get("context_is_growing"):
+                print(f"   💡 Context compression (summarizing older steps) can cut")
+                print(f"      input costs by 30-60% in long agent workflows.")
+            print_divider()
+
+        # ── SDK helper functions hint ──────────────────────────────────────
+        print(f"\n{Colors.BOLD}{Colors.BLUE}🔧  SDK UTILITIES (NEW){Colors.END}")
+        print(f"   Use these anywhere in your code — no extra setup needed:\n")
+        print(f"   {Colors.CYAN}llmoptimize.select_model(code){Colors.END}")
+        print(f"     → Pick the cheapest Groq model for a given code task")
+        print(f"       (saves up to 84% vs always using 70B)\n")
+        print(f"   {Colors.CYAN}llmoptimize.check_loop(actions){Colors.END}")
+        print(f"     → Detect agent loops before they waste API budget\n")
+        print(f"   {Colors.CYAN}llmoptimize.analyze(prompt, model){Colors.END}")
+        print(f"     → Instant recommendation: cheapest model for this prompt\n")
+        print(f"   {Colors.CYAN}with llmoptimize.task('my-pipeline'):{Colors.END}")
+        print(f"     → Isolated named session with auto report on exit\n")
+        print(f"   {Colors.YELLOW}LangChain / CrewAI users:{Colors.END}")
+        print(f"     Just add  {Colors.CYAN}import llmoptimize{Colors.END}  at the top —")
+        print(f"     all LLM calls inside chains and agents are tracked automatically.")
         print_divider()
 
         choice = interactive_prompt()
@@ -721,6 +929,25 @@ class LLMOptimize:
         print("\n💡 RECOMMENDATIONS")
         for rec in data.get("recommendations", [])[:3]:
             print(f"  ✓ Switch to {rec['model']} — {rec.get('reason', '')}")
+
+        agent = data.get("agent_insights")
+        if agent and agent.get("optimization_tips"):
+            print("\n🤖 AGENT INSIGHTS")
+            for tip in agent["optimization_tips"]:
+                print(f"  • {tip}")
+
+        cache = data.get("cache_insights")
+        if cache:
+            print(f"\n⚡ CACHING: {cache.get('message', '')}")
+
+        ml = data.get("ml_insights")
+        if ml:
+            print(f"\n🧠 ML: {ml.get('message', '')}")
+
+        opt = data.get("optimizer_insights")
+        if opt and opt.get("context_is_growing"):
+            print(f"\n📏 OPTIMIZER: {opt.get('message', '')}")
+
         print()
 
     def _open_html_report(self, data):

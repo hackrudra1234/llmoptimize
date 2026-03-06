@@ -31,6 +31,9 @@ LLMOptimize is a **complete AI cost optimization SDK** that silently watches eve
 | 🤖 Agent workflow | Multi-step tracking, context growth, step analytics |
 | 📏 Context optimizer | Detects context window growth, compression tips |
 | 🛡️ Security guardrails | Flags if API keys or sensitive data appear in prompts |
+| 💸 Budget guardrail | Raises an exception the moment spend exceeds your limit |
+| 🔍 Cost estimator | Pre-call USD estimate for any prompt + model (no API call) |
+| ⚖️ Model comparator | Side-by-side cost table across any model list |
 
 ---
 
@@ -291,6 +294,94 @@ r.result["overall"]["estimated_monthly_savings_usd"]  # → 97.8
 
 ---
 
+### Budget Guardrail
+
+Enforce a per-block spend limit — `BudgetExceeded` is raised the instant a patched call
+pushes spend over the cap. Use `warn_only=True` to log instead of raising.
+
+```python
+from llmoptimize import BudgetExceeded
+
+try:
+    with llmoptimize.budget(max_usd=0.05):
+        client.chat.completions.create(model="gpt-4", messages=[...])
+        client.chat.completions.create(model="gpt-4", messages=[...])   # may raise here
+except BudgetExceeded as e:
+    print(e)   # "Budget of $0.0500 exceeded (spent $0.0620 on this session)"
+
+# Warn instead of raising:
+with llmoptimize.budget(max_usd=0.10, warn_only=True):
+    client.chat.completions.create(model="gpt-4", messages=[...])
+
+# Check spend inside the block:
+with llmoptimize.budget(max_usd=1.00) as b:
+    client.chat.completions.create(...)
+    print(b.spent, b.remaining)   # live USD figures
+```
+
+The check is **real-time** — it fires inside the API call that crosses the limit,
+not just at exit. Only calls made *within* the block count toward the limit.
+
+---
+
+### Pre-Call Cost Estimate
+
+Get the USD cost of a prompt + model combo before making the real call.
+Uses the server pricing database (60+ models). No API key needed.
+
+```python
+result = llmoptimize.estimate(
+    prompt        = "Summarise this 10-page report...",
+    model         = "gpt-4",
+    output_tokens = 200,          # expected output length (default 100)
+)
+
+# result["estimated_cost_usd"]  -> 0.00792
+# result["input_tokens"]        -> 194
+# result["input_cost_per_1k"]   -> 0.03
+# result["output_cost_per_1k"]  -> 0.06
+```
+
+---
+
+### Multi-Model Cost Comparison
+
+Compare the cost of the same prompt across any list of models. No real API calls made.
+
+`sort_by="cost"` (default) — cheapest-first, pure pricing.
+`sort_by="value"` — best cost-per-quality-tier first. A tier-3 model at 3× the price of a tier-1 model gets the same value score — rewarding models that are both cheaper *and* more capable.
+
+```python
+# Cost-only ranking (default)
+result = llmoptimize.compare(
+    prompt        = "Classify this support ticket as urgent or normal.",
+    models        = ["gpt-4", "gpt-4o", "gpt-4o-mini", "claude-3-haiku"],
+    output_tokens = 50,
+)
+for r in result["rankings"]:
+    print(r["model"], r["cost_usd"], r["quality_tier"])
+# claude-3-haiku  0.00000125  tier=2
+# gpt-4o-mini     0.00000125  tier=2
+# gpt-4o          0.00001625  tier=3
+# gpt-4           0.00006200  tier=4
+
+# Value ranking — balances cost and capability
+result = llmoptimize.compare(
+    prompt        = "Classify this support ticket as urgent or normal.",
+    models        = ["gpt-4", "gpt-4o", "gpt-4o-mini", "claude-3-haiku"],
+    sort_by       = "value",
+)
+for r in result["rankings"]:
+    print(r["model"], r["value_score"], r["value_savings_vs_worst_pct"])
+# gpt-4o-mini  0.0000000625  94%
+# gpt-4o       0.0000054167  99%  ← strong model, reasonable value
+# claude-3-haiku ...
+```
+
+Quality tiers: `1` = lightweight · `2` = capable · `3` = strong · `4` = frontier
+
+---
+
 ## LangChain & CrewAI
 
 No changes needed to your agents or chains. Just add `import llmoptimize` at the top — all LLM calls inside chains and agents are tracked automatically.
@@ -521,6 +612,14 @@ with llmoptimize.task("plan", dry_run=True):  # dry-run + labelled report
 result = llmoptimize.analyze(prompt, model)   # instant recommendation
 result = llmoptimize.select_model(code)       # pick cheapest Groq model
 result = llmoptimize.check_loop(actions)      # detect agent loops
+result = llmoptimize.estimate(prompt, model)  # pre-call cost estimate
+result = llmoptimize.compare(prompt, models)  # side-by-side cost table
+
+# ── Budget guardrail ───────────────────────────────────────────
+with llmoptimize.budget(max_usd=0.10):        # raises BudgetExceeded if over
+    ...
+with llmoptimize.budget(0.10, warn_only=True): # warns instead of raising
+    ...
 
 # ── RAG pipeline ──────────────────────────────────────────────
 with llmoptimize.rag(
@@ -565,9 +664,18 @@ It sends your code/task description to the server's GroqModelSelector — a hybr
 **What does `check_loop()` do?**
 It sends a list of action strings to the server's LoopDetector, which uses AI-powered + rule-based detection for exact repeats, circular patterns (A→B→C→A), alternating loops, and semantic loops (different words, same intent). Returns which steps are looping and a recommendation to fix it.
 
+**What does `budget()` do?**
+It enforces a real-time spend limit. As soon as any patched call inside the block pushes cost above `max_usd`, a `BudgetExceeded` exception is raised immediately — not on exit. Use `warn_only=True` to log a warning instead. `.spent` and `.remaining` are readable inside the block.
+
+**What does `estimate()` do?**
+It returns a USD cost breakdown for a prompt + model before you make the real call. Uses the server's 60-model pricing database. Useful for sanity-checking expensive prompts or building cost-aware routing. No API key needed.
+
+**What does `compare()` do?**
+It calculates the cost of a prompt across a list of models (no real API calls) and returns a ranked table. Default `sort_by="cost"` sorts cheapest-first. Use `sort_by="value"` for quality-aware ranking — each model's cost is divided by its capability tier (1–4), so a powerful model at a fair price beats a cheap but weak one. Each result includes `quality_tier` and `value_score`.
+
 **What does `llmoptimize.rag()` do?**
 It's a context manager you wrap around your RAG pipeline. Pass your loaded docs and your splitter/model config — on exit it sends the stats to the server's `RAGPipelineAnalyzer` which recommends the optimal chunk size, overlap, embedding model, and LLM for your document sizes and query type. No changes to your pipeline code needed.
 
 ---
 
-*LLMOptimize v3.3.0 — spend less, build more.*
+*LLMOptimize v3.4.0 — spend less, build more.*

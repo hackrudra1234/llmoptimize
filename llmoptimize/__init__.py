@@ -6,7 +6,7 @@ It intercepts AI API calls silently, then tells you how to save money.
 It never makes AI API calls itself — no API key needed for recommendations.
 """
 
-__version__ = "3.2.2"
+__version__ = "3.4.0"
 __author__  = "LLMOptimize Team"
 
 import os
@@ -48,71 +48,49 @@ RUN_ID: str = str(uuid.uuid4())
 
 # ── Tracking ──────────────────────────────────────────────────────────────────
 
-def _track_call(
-    model:             str,
-    prompt_tokens:     int,
-    completion_tokens: int = 0,
-    provider:          str = "unknown",
-    prompt_preview:    str = "",
-) -> None:
-    """
-    Record one call in both the local MagicSession (instant, no server needed)
-    and fire-and-forget POST to the server (for cross-session analytics).
-    Never blocks or raises — completely silent.
-    """
-    # 1. Local in-process session — always works, no server needed
-    try:
-        from server.core.magic import get_session, get_caller_frame
-        get_session().record_call(
-            provider          = provider,
-            model             = model,
-            prompt_tokens     = prompt_tokens,
-            completion_tokens = completion_tokens,
-            duration_ms       = 0,
-            caller_frame      = get_caller_frame(),
-            prompt_preview    = prompt_preview[:80],
-        )
-    except Exception:
-        pass
-
-    # 2. Server POST — best-effort, silent failure is fine
-    try:
-        payload = json.dumps({
-            "model":             model,
-            "prompt_tokens":     prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "session_id":        RUN_ID,
-            "provider":          provider,
-            "prompt_preview":    prompt_preview[:100],
-            "sdk_version":       __version__,
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"{SERVER_URL}/track",
-            data    = payload,
-            method  = "POST",
-            headers = {
-                "Content-Type": "application/json",
-                "User-Agent":   f"llmoptimize/{__version__}",
-            },
-        )
-        urllib.request.urlopen(req, timeout=3)
-    except Exception:
-        pass
-
-
 # ── Auto-patching ─────────────────────────────────────────────────────────────
-# Silently patches OpenAI / Anthropic / Groq / Gemini / Mistral / Cohere
-# so every API call is automatically tracked. No output produced here.
+# Always use the self-contained llmoptimize.patcher (works in all environments).
+# Falls back to server.utils.patcher when running inside the full dev project.
 
-try:
-    from server.utils.patcher import patch_all as _patch_all
-    _patch_all()
-except Exception as _e:
-    log.debug("patcher.patch_all() failed: %s", _e)
+from llmoptimize.patcher import (
+    patch_all as _patch_all,
+    enable_dry_run as _enable_dry_run,
+    disable_dry_run as _disable_dry_run,
+    reset_local_session as _reset_local_session,
+    _record as _patcher_record,
+)
+_patch_all()
 
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 _dashboard_client = LLMOptimize()
+
+
+class _ReportContext:
+    """
+    Returned by ``report(...)`` — shows report immediately if not used as a
+    context manager; enables dry-run mode if used with ``with``.
+    """
+
+    def __init__(self, interactive: bool = True):
+        self._interactive = interactive
+        self._entered = False
+
+    def __enter__(self):
+        self._entered = True
+        _enable_dry_run()
+        return self
+
+    def __exit__(self, *_):
+        _disable_dry_run()
+        _dashboard_client.report(interactive=self._interactive)
+        return False
+
+    def __del__(self):
+        # Called when the object is garbage-collected (i.e. used as a plain
+        # function call rather than a context manager).
+        if not self._entered:
+            _dashboard_client.report(interactive=self._interactive)
 
 
 class _Report:
@@ -120,31 +98,27 @@ class _Report:
     Dual-mode report helper — exposed as ``llmoptimize.report``.
 
     Direct call — show cost & recommendations for calls tracked so far:
-        llmoptimize.report()
+        llmoptimize.report()                      # interactive (browser option)
+        llmoptimize.report(interactive=False)     # plain text report
 
     Context manager — dry-run mode (no real API calls, no cost):
-        with llmoptimize.report:
-            resp = client.chat.completions.create(model="gpt-4o", ...)
-        # recommendations printed on exit; remove `with` to go live
+        with llmoptimize.report:                          # interactive on exit
+            resp = client.chat.completions.create(...)
+        with llmoptimize.report():                        # same
+            ...
+        with llmoptimize.report(interactive=False):       # plain report on exit
+            ...
     """
 
-    def __call__(self, interactive: bool = True) -> None:
-        _dashboard_client.report(interactive=interactive)
+    def __call__(self, interactive: bool = True) -> _ReportContext:
+        return _ReportContext(interactive)
 
     def __enter__(self):
-        try:
-            from server.utils.patcher import enable_dry_run
-            enable_dry_run()
-        except Exception as e:
-            log.debug("enable_dry_run failed: %s", e)
+        _enable_dry_run()
         return self
 
     def __exit__(self, *_):
-        try:
-            from server.utils.patcher import disable_dry_run
-            disable_dry_run()
-        except Exception as e:
-            log.debug("disable_dry_run failed: %s", e)
+        _disable_dry_run()
         _dashboard_client.report(interactive=True)
         return False
 
@@ -160,7 +134,7 @@ def track(
     prompt_preview:    str = "",
 ) -> dict:
     """Manually track a call — no real API needed."""
-    _track_call(model, prompt_tokens, completion_tokens, provider, prompt_preview)
+    _patcher_record(provider, model, prompt_tokens, completion_tokens, 0, None, prompt_preview)
     return {"status": "tracked"}
 
 
@@ -193,6 +167,7 @@ def new_session() -> str:
         reset_session()
     except Exception:
         pass
+    _reset_local_session()
     _dashboard_client.session_id = RUN_ID
     return SESSION_ID
 
@@ -219,22 +194,14 @@ class _Task:
         self._dry_run = dry_run
 
     def __enter__(self):
-        new_session()                      # clean slate for this task
+        new_session()
         if self._dry_run:
-            try:
-                from server.utils.patcher import enable_dry_run
-                enable_dry_run()
-            except Exception as e:
-                log.debug("enable_dry_run failed: %s", e)
+            _enable_dry_run()
         return self
 
     def __exit__(self, *_):
         if self._dry_run:
-            try:
-                from server.utils.patcher import disable_dry_run
-                disable_dry_run()
-            except Exception as e:
-                log.debug("disable_dry_run failed: %s", e)
+            _disable_dry_run()
         _dashboard_client.report(interactive=True, task_name=self._name)
         return False
 
@@ -258,7 +225,219 @@ def task(name: str, dry_run: bool = False) -> _Task:
     return _Task(name, dry_run)
 
 
+def _http_post(endpoint: str, payload: dict, timeout: int = 8) -> dict:
+    """POST to the server. Returns parsed JSON or {'success': False, 'error': ...}."""
+    try:
+        body = json.dumps(payload).encode("utf-8")
+        req  = urllib.request.Request(
+            f"{SERVER_URL}{endpoint}",
+            data    = body,
+            method  = "POST",
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent":   f"llmoptimize/{__version__}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
+
+
+def select_model(code: str) -> dict:
+    """
+    Get the optimal Groq model for a code/task string.
+
+    Uses server-side GroqModelSelector (rule-based + cache, no API key needed).
+    Returns model ID, complexity level, cost savings vs the heavy 70B model.
+
+    Example::
+
+        result = llmoptimize.select_model(\"\"\"
+            Extract the user name from this JSON string.
+        \"\"\")
+        # result["selected_model"] -> "llama-3.1-8b-instant"
+        # result["complexity_level"] -> "simple"
+        # result["vs_heavy_model"]["savings_pct"] -> 84
+    """
+    return _http_post("/api/select-model", {"code": code})
+
+
+def check_loop(actions: list) -> dict:
+    """
+    Check a list of agent action strings for loop/repetition patterns.
+
+    Detects: exact repeats, circular patterns (A→B→C→A), alternating loops.
+    No API key needed — server-side rule-based detection.
+
+    Example::
+
+        result = llmoptimize.check_loop([
+            "search web for python docs",
+            "read python docs",
+            "search web for python docs",   # repeated!
+            "read python docs",
+        ])
+        # result["loop_detected"] -> True
+        # result["loops"][0]["pattern_type"] -> "exact_repeat"
+    """
+    if not isinstance(actions, list):
+        actions = list(actions)
+    return _http_post("/api/loop-check", {"actions": actions})
+
+
+def rag(
+    docs=None,
+    chunk_size: int = None,
+    chunk_overlap: int = None,
+    embedding_model: str = None,
+    llm_model: str = None,
+    query_type: str = None,
+    silent: bool = False,
+):
+    """
+    Context manager that analyses your RAG pipeline and prints recommendations.
+
+    Wraps your full RAG setup — pass your loaded docs plus the config you're
+    using. On exit, the server computes optimal chunk size, overlap, embedding
+    model, and LLM model, then prints actionable recommendations.
+
+    Example::
+
+        loader = PyPDFLoader("docs/report.pdf")
+        pages  = loader.load()
+
+        with llmoptimize.rag(
+            docs=pages,
+            chunk_size=1000,
+            chunk_overlap=200,
+            embedding_model="text-embedding-ada-002",
+            llm_model="gpt-4",
+        ):
+            chunks      = splitter.split_documents(pages)
+            vectorstore = FAISS.from_documents(chunks, embeddings)
+            result      = qa_chain.run("What is X?")
+        # Recommendations print automatically on exit
+    """
+    from llmoptimize.rag import RAGContext
+    return RAGContext(
+        docs=docs,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        embedding_model=embedding_model,
+        llm_model=llm_model,
+        query_type=query_type,
+        silent=silent,
+    )
+
+
+def analyze(prompt: str, model: str) -> dict:
+    """
+    Get a smart optimization recommendation for a specific prompt + model combo.
+
+    Uses server-side heuristic + ML pipeline (no API key needed).
+    Returns suggested cheaper model with confidence and savings estimate.
+
+    Example::
+
+        result = llmoptimize.analyze(
+            prompt="Classify this support ticket as urgent or normal: ...",
+            model="gpt-4o",
+        )
+        # result["recommendation"]["suggested_model"] -> "gpt-4o-mini"
+        # result["recommendation"]["estimated_savings_percent"] -> 96
+    """
+    return _http_post("/api/recommend", {
+        "prompt_preview": prompt[:200],
+        "current_model":  model,
+    })
+
+
+
+def budget(max_usd: float, warn_only: bool = False):
+    """
+    Context manager that enforces a spend limit on patched AI API calls.
+
+    Raises BudgetExceeded (or prints a warning if warn_only=True) as soon as
+    accumulated spend within the block exceeds max_usd.
+
+    Inside the block you can read .spent and .remaining at any time.
+
+    Example::
+
+        with llmoptimize.budget(max_usd=0.10):
+            client.chat.completions.create(model="gpt-4", ...)
+
+        # warn instead of raising:
+        with llmoptimize.budget(max_usd=0.10, warn_only=True):
+            ...
+    """
+    from llmoptimize.budget import BudgetContext
+    return BudgetContext(max_usd, warn_only)
+
+
+def estimate(prompt: str, model: str, output_tokens: int = 100) -> dict:
+    """
+    Pre-call cost estimate for a prompt + model combo (no real API call).
+
+    Uses the server pricing database (60+ models). Falls back to local
+    pricing table if the server is unreachable.
+
+    Example::
+
+        result = llmoptimize.estimate("Summarise this report...", "gpt-4")
+        # result["estimated_cost_usd"] -> 0.0042
+        # result["input_tokens"]       -> 140
+    """
+    return _http_post("/api/estimate", {
+        "prompt":        prompt[:500],
+        "model":         model,
+        "output_tokens": output_tokens,
+    })
+
+
+def compare(
+    prompt: str,
+    models: list,
+    output_tokens: int = 100,
+    sort_by: str = "cost",
+) -> dict:
+    """
+    Compare the cost of a prompt across multiple models (no real API calls).
+
+    sort_by="cost"  (default) — cheapest-first, pure pricing.
+    sort_by="value" — best cost-per-quality-tier first; rewards models that
+                      are both cheaper AND more capable.
+
+    Each ranking item includes:
+      model, cost_usd, savings_vs_most_expensive_pct, quality_tier (1-4),
+      value_score (cost / quality_tier — lower is better).
+    When sort_by="value", also includes value_savings_vs_worst_pct.
+
+    Example::
+
+        result = llmoptimize.compare(
+            "Classify this support ticket as urgent or normal.",
+            models=["gpt-4", "gpt-4o", "gpt-4o-mini", "claude-3-haiku"],
+            sort_by="value",
+        )
+        # result["rankings"][0]["model"]         -> "gpt-4o-mini"
+        # result["rankings"][0]["quality_tier"]  -> 2
+        # result["rankings"][0]["value_score"]   -> 0.000075
+    """
+    if not isinstance(models, list):
+        models = list(models)
+    return _http_post("/api/compare", {
+        "prompt":        prompt[:500],
+        "models":        models,
+        "output_tokens": output_tokens,
+        "sort_by":       sort_by,
+    })
+
+
 __all__ = [
     "report", "track", "task", "new_session",
+    "select_model", "check_loop", "analyze", "rag",
+    "budget", "estimate", "compare",
     "__version__", "SESSION_ID", "RUN_ID", "SERVER_URL",
 ]
