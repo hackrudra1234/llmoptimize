@@ -42,6 +42,23 @@ _MODEL_COSTS = {
     "voyage-3-lite":           {"input": 0.000016, "output": 0},
     # Embeddings — Jina AI
     "jina-embeddings-v3":      {"input": 0.000018, "output": 0},
+    # Google Gemini
+    "gemini-1.5-pro":          {"input": 0.00125,  "output": 0.005},
+    "gemini-1.5-flash":        {"input": 0.000075, "output": 0.0003},
+    "gemini-2.0-flash":        {"input": 0.0001,   "output": 0.0004},
+    "gemini-pro":              {"input": 0.0005,   "output": 0.0015},
+    # Mistral
+    "mistral-large-latest":    {"input": 0.002,    "output": 0.006},
+    "mistral-small-latest":    {"input": 0.0002,   "output": 0.0006},
+    "mistral-tiny":            {"input": 0.00015,  "output": 0.00045},
+    "open-mixtral-8x7b":       {"input": 0.0007,   "output": 0.0007},
+    # Cohere
+    "command-r-plus":          {"input": 0.002,    "output": 0.01},
+    "command-r":               {"input": 0.00015,  "output": 0.0006},
+    "command-light":           {"input": 0.00015,  "output": 0.00015},
+    # Cohere embeddings
+    "embed-english-v3.0":      {"input": 0.0001,   "output": 0},
+    "embed-multilingual-v3.0": {"input": 0.0001,   "output": 0},
 }
 
 # Maps each model to a list of cheaper alternatives (best first).
@@ -174,6 +191,60 @@ def is_dry_run() -> bool:
     return _DRY_RUN
 
 
+
+
+# ── Hardcoded API key warnings ───────────────────────────────────────────────────────
+
+import logging as _logging
+_log = _logging.getLogger(__name__)
+_warned_keys: set = set()
+
+
+def _check_api_key_kwarg(provider: str, kwargs: dict):
+    """Warn (once per key) if api_key= is hardcoded in constructor."""
+    _KEY_NAMES = ("api_key", "token", "api_token")
+    if not any(k in kwargs for k in _KEY_NAMES):
+        return
+    value = next((kwargs[k] for k in _KEY_NAMES if k in kwargs and kwargs[k]), None)
+    display = value if (value and isinstance(value, str)) else "<empty>"
+    if display not in _warned_keys:
+        _warned_keys.add(display)
+        redacted = display[:8] + "..." if len(display) > 8 else "***"
+        _log.debug("llmoptimize: %s client constructed with explicit api_key= (%s)", provider, redacted)
+
+
+def _check_positional_key(provider: str, args: tuple):
+    """Warn if api_key passed as first positional arg (Mistral, Cohere)."""
+    key = args[0] if args and isinstance(args[0], str) else None
+    if key and key not in _warned_keys:
+        _warned_keys.add(key)
+        redacted = key[:8] + "..." if len(key) > 8 else "***"
+        _log.debug("llmoptimize: %s client with positional api_key= (%s)", provider, redacted)
+
+
+# ── Lightweight prompt security scan ────────────────────────────────────────────
+
+import re as _re
+
+_SECRET_PATTERNS = [
+    _re.compile(r"(sk-[a-zA-Z0-9]{20,})"),           # OpenAI key
+    _re.compile(r"(sk-ant-[a-zA-Z0-9\-]{20,})"),     # Anthropic key
+    _re.compile(r"(gsk_[a-zA-Z0-9]{20,})"),           # Groq key
+    _re.compile(r"(AIza[a-zA-Z0-9_\-]{30,})"),        # Google API key
+    _re.compile(r"(ghp_[a-zA-Z0-9]{36})"),            # GitHub token
+    _re.compile(r"(AKIA[A-Z0-9]{16})"),               # AWS access key
+]
+
+
+def _redact_preview(preview: str) -> str:
+    """Redact obvious API keys/tokens from prompt preview before sending."""
+    if not preview:
+        return ""
+    for pattern in _SECRET_PATTERNS:
+        preview = pattern.sub("[REDACTED]", preview)
+    return preview
+
+
 # ── Mock responses ────────────────────────────────────────────────────────────
 
 def _mock_chat_response(model: str, prompt_tokens: int):
@@ -246,6 +317,41 @@ def _anthropic_tokens(resp) -> Tuple[int, int]:
         return 0, 0
 
 
+
+def _gemini_tokens(resp) -> Tuple[int, int]:
+    try:
+        if hasattr(resp, "usage_metadata"):
+            meta = resp.usage_metadata
+            return (
+                getattr(meta, "prompt_token_count", 0) or 0,
+                getattr(meta, "candidates_token_count", 0) or 0,
+            )
+    except Exception:
+        pass
+    return 0, 0
+
+def _mistral_tokens(resp) -> Tuple[int, int]:
+    try:
+        u = resp.usage
+        return getattr(u, "prompt_tokens", 0) or 0, getattr(u, "completion_tokens", 0) or 0
+    except Exception:
+        return 0, 0
+
+def _cohere_tokens(resp) -> Tuple[int, int]:
+    try:
+        if hasattr(resp, "usage") and resp.usage:
+            tokens = resp.usage
+            input_t  = getattr(tokens, "input_tokens", None)
+            output_t = getattr(tokens, "output_tokens", None)
+            if input_t is None and hasattr(tokens, "billed_units"):
+                input_t  = getattr(tokens.billed_units, "input_tokens", 0)
+                output_t = getattr(tokens.billed_units, "output_tokens", 0)
+            return (input_t or 0, output_t or 0)
+    except Exception:
+        pass
+    return 0, 0
+
+
 # ── Agent framework detection ─────────────────────────────────────────────────
 
 # Known agent framework module path fragments
@@ -316,7 +422,7 @@ def _record(provider, model, prompt_tokens, completion_tokens, prompt_preview=""
             "completion_tokens": completion_tokens,
             "session_id":        _sid,
             "provider":          provider,
-            "prompt_preview":    prompt_preview[:100],
+            "prompt_preview":    _redact_preview(prompt_preview[:100]),
             "sdk_version":       _ver,
             "agent_framework":   _framework,
         }).encode("utf-8")
@@ -341,6 +447,21 @@ _patched = {"openai": False, "anthropic": False, "groq": False,
 def patch_openai():
     if _patched["openai"]:
         return
+
+    # Warn if OpenAI(api_key=...) is hardcoded
+    try:
+        import openai as _openai_mod
+        _OpenAI = getattr(_openai_mod, "OpenAI", None)
+        if _OpenAI:
+            _orig_oi_init = _OpenAI.__init__
+            @functools.wraps(_orig_oi_init)
+            def _oi_init(self_client, *args, **kwargs):
+                _check_api_key_kwarg("openai", kwargs)
+                _orig_oi_init(self_client, *args, **kwargs)
+            _OpenAI.__init__ = _oi_init
+    except Exception:
+        pass
+
     try:
         from openai.resources.chat.completions import Completions
         _orig = Completions.create
@@ -361,6 +482,29 @@ def patch_openai():
             return resp
 
         Completions.create = _chat
+
+        try:
+            from openai.resources.chat.completions import AsyncCompletions
+            _orig_async_chat = AsyncCompletions.create
+
+            @functools.wraps(_orig_async_chat)
+            async def _async_chat(self_obj, *args, **kwargs):
+                model = kwargs.get("model") or "openai/unknown"
+                msgs  = kwargs.get("messages", [])
+                preview = _extract_preview(msgs)
+                if _DRY_RUN:
+                    p = _estimate_tokens(msgs)
+                    _record("openai", model, p, 0, preview)
+                    return _mock_chat_response(model, p)
+                resp = await _orig_async_chat(self_obj, *args, **kwargs)
+                p, c = _openai_tokens(resp)
+                _record("openai", model, p, c, preview)
+                return resp
+
+            AsyncCompletions.create = _async_chat
+        except (ImportError, AttributeError):
+            pass
+
     except Exception:
         pass
 
@@ -394,6 +538,21 @@ def patch_openai():
 def patch_anthropic():
     if _patched["anthropic"]:
         return
+
+    # Warn if Anthropic(api_key=...) is hardcoded
+    try:
+        import anthropic as _anthropic_mod
+        _Anthropic = getattr(_anthropic_mod, "Anthropic", None)
+        if _Anthropic:
+            _orig_an_init = _Anthropic.__init__
+            @functools.wraps(_orig_an_init)
+            def _an_init(self_client, *args, **kwargs):
+                _check_api_key_kwarg("anthropic", kwargs)
+                _orig_an_init(self_client, *args, **kwargs)
+            _Anthropic.__init__ = _an_init
+    except Exception:
+        pass
+
     try:
         from anthropic.resources.messages import Messages
         _orig = Messages.create
@@ -413,6 +572,29 @@ def patch_anthropic():
             return resp
 
         Messages.create = _msg
+
+        try:
+            from anthropic.resources.messages import AsyncMessages
+            _orig_async_msg = AsyncMessages.create
+
+            @functools.wraps(_orig_async_msg)
+            async def _async_msg(self_obj, *args, **kwargs):
+                model   = kwargs.get("model") or "anthropic/unknown"
+                msgs    = kwargs.get("messages", [])
+                preview = _extract_preview(msgs)
+                if _DRY_RUN:
+                    p = _estimate_tokens(msgs)
+                    _record("anthropic", model, p, 0, preview)
+                    return _mock_anthropic_response(model, p)
+                resp = await _orig_async_msg(self_obj, *args, **kwargs)
+                p, c = _anthropic_tokens(resp)
+                _record("anthropic", model, p, c, preview)
+                return resp
+
+            AsyncMessages.create = _async_msg
+        except (ImportError, AttributeError):
+            pass
+
         _patched["anthropic"] = True
     except Exception:
         pass
@@ -423,6 +605,21 @@ def patch_anthropic():
 def patch_groq():
     if _patched["groq"]:
         return
+
+    # Warn if Groq(api_key=...) is hardcoded
+    try:
+        import groq as _groq_mod
+        _Groq = getattr(_groq_mod, "Groq", None)
+        if _Groq:
+            _orig_gq_init = _Groq.__init__
+            @functools.wraps(_orig_gq_init)
+            def _gq_init(self_client, *args, **kwargs):
+                _check_api_key_kwarg("groq", kwargs)
+                _orig_gq_init(self_client, *args, **kwargs)
+            _Groq.__init__ = _gq_init
+    except Exception:
+        pass
+
     try:
         from groq.resources.chat.completions import Completions as GC
         _orig = GC.create
@@ -442,6 +639,29 @@ def patch_groq():
             return resp
 
         GC.create = _chat
+
+        try:
+            from groq.resources.chat.completions import AsyncCompletions as GAsyncC
+            _orig_async_groq = GAsyncC.create
+
+            @functools.wraps(_orig_async_groq)
+            async def _async_groq(self_obj, *args, **kwargs):
+                model   = kwargs.get("model") or "groq/unknown"
+                msgs    = kwargs.get("messages", [])
+                preview = _extract_preview(msgs)
+                if _DRY_RUN:
+                    p = _estimate_tokens(msgs)
+                    _record("groq", model, p, 0, preview)
+                    return _mock_chat_response(model, p)
+                resp = await _orig_async_groq(self_obj, *args, **kwargs)
+                p, c = _openai_tokens(resp)
+                _record("groq", model, p, c, preview)
+                return resp
+
+            GAsyncC.create = _async_groq
+        except (ImportError, AttributeError):
+            pass
+
         _patched["groq"] = True
     except Exception:
         pass
@@ -449,10 +669,217 @@ def patch_groq():
 
 # ── patch_all ─────────────────────────────────────────────────────────────────
 
+
+
+# ── Gemini patcher ──────────────────────────────────────────────────────────────────
+
+def patch_gemini():
+    if _patched["gemini"]:
+        return
+
+    # Constructor key warning
+    try:
+        import google.genai as genai
+        _orig_configure = getattr(genai, "configure", None)
+        if _orig_configure:
+            @functools.wraps(_orig_configure)
+            def _patched_configure(*args, **kwargs):
+                _check_api_key_kwarg("gemini", kwargs)
+                return _orig_configure(*args, **kwargs)
+            genai.configure = _patched_configure
+    except Exception:
+        pass
+
+    try:
+        import google.genai as genai
+        GenerativeModel = getattr(genai, "GenerativeModel", None)
+        if GenerativeModel is None:
+            return
+
+        _orig_generate = GenerativeModel.generate_content
+
+        @functools.wraps(_orig_generate)
+        def _sync_gen(self_obj, *args, **kwargs):
+            model    = (getattr(self_obj, "model_name", None) or "gemini/unknown").replace("models/", "")
+            contents = args[0] if args else kwargs.get("contents", "")
+            preview  = _extract_preview(contents if isinstance(contents, list) else str(contents))
+            if _DRY_RUN:
+                p = _estimate_tokens(contents)
+                _record("gemini", model, p, 0, preview)
+                return _mock_chat_response(model, p)
+            resp = _orig_generate(self_obj, *args, **kwargs)
+            p, c = _gemini_tokens(resp)
+            _record("gemini", model, p, c, preview)
+            return resp
+
+        GenerativeModel.generate_content = _sync_gen
+
+        _orig_gen_async = getattr(GenerativeModel, "generate_content_async", None)
+        if _orig_gen_async:
+            @functools.wraps(_orig_gen_async)
+            async def _async_gen(self_obj, *args, **kwargs):
+                model    = (getattr(self_obj, "model_name", None) or "gemini/unknown").replace("models/", "")
+                contents = args[0] if args else kwargs.get("contents", "")
+                preview  = _extract_preview(contents if isinstance(contents, list) else str(contents))
+                if _DRY_RUN:
+                    p = _estimate_tokens(contents)
+                    _record("gemini", model, p, 0, preview)
+                    return _mock_chat_response(model, p)
+                resp = await _orig_gen_async(self_obj, *args, **kwargs)
+                p, c = _gemini_tokens(resp)
+                _record("gemini", model, p, c, preview)
+                return resp
+
+            GenerativeModel.generate_content_async = _async_gen
+
+        _patched["gemini"] = True
+
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+
+# ── Mistral patcher ─────────────────────────────────────────────────────────────────
+
+def patch_mistral():
+    if _patched["mistral"]:
+        return
+    try:
+        from mistralai import Mistral
+        _orig_init = Mistral.__init__
+
+        @functools.wraps(_orig_init)
+        def _patched_init(self_client, *args, **kwargs):
+            _check_api_key_kwarg("mistral", kwargs)
+            _check_positional_key("mistral", args)
+            _orig_init(self_client, *args, **kwargs)
+            try:
+                _orig_complete = self_client.chat.complete
+
+                @functools.wraps(_orig_complete)
+                def _sync_complete(*a, **kw):
+                    model   = kw.get("model") or "mistral/unknown"
+                    msgs    = kw.get("messages", [])
+                    preview = _extract_preview(msgs)
+                    if _DRY_RUN:
+                        p = _estimate_tokens(msgs)
+                        _record("mistral", model, p, 0, preview)
+                        return _mock_chat_response(model, p)
+                    resp = _orig_complete(*a, **kw)
+                    p, c = _mistral_tokens(resp)
+                    _record("mistral", model, p, c, preview)
+                    return resp
+
+                self_client.chat.complete = _sync_complete
+
+                if hasattr(self_client.chat, "complete_async"):
+                    _orig_async = self_client.chat.complete_async
+
+                    @functools.wraps(_orig_async)
+                    async def _async_complete(*a, **kw):
+                        model   = kw.get("model") or "mistral/unknown"
+                        msgs    = kw.get("messages", [])
+                        preview = _extract_preview(msgs)
+                        if _DRY_RUN:
+                            p = _estimate_tokens(msgs)
+                            _record("mistral", model, p, 0, preview)
+                            return _mock_chat_response(model, p)
+                        resp = await _orig_async(*a, **kw)
+                        p, c = _mistral_tokens(resp)
+                        _record("mistral", model, p, c, preview)
+                        return resp
+
+                    self_client.chat.complete_async = _async_complete
+
+            except (AttributeError, TypeError):
+                pass
+
+        Mistral.__init__ = _patched_init
+        _patched["mistral"] = True
+
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+
+# ── Cohere patcher ──────────────────────────────────────────────────────────────────
+
+def patch_cohere():
+    if _patched["cohere"]:
+        return
+    try:
+        import cohere
+        CohereClient = getattr(cohere, "ClientV2", None) or getattr(cohere, "Client", None)
+        if CohereClient is None:
+            return
+
+        _orig_init = CohereClient.__init__
+
+        @functools.wraps(_orig_init)
+        def _patched_init(self_client, *args, **kwargs):
+            _check_api_key_kwarg("cohere", kwargs)
+            _check_positional_key("cohere", args)
+            _orig_init(self_client, *args, **kwargs)
+            try:
+                _orig_chat = self_client.chat
+
+                @functools.wraps(_orig_chat)
+                def _sync_chat(*a, **kw):
+                    model   = kw.get("model") or "cohere/unknown"
+                    preview = _extract_preview(kw.get("messages", []))
+                    if _DRY_RUN:
+                        p = _estimate_tokens(kw.get("messages", []))
+                        _record("cohere", model, p, 0, preview)
+                        return _mock_chat_response(model, p)
+                    resp = _orig_chat(*a, **kw)
+                    p, c = _cohere_tokens(resp)
+                    _record("cohere", model, p, c, preview)
+                    return resp
+
+                self_client.chat = _sync_chat
+
+                if hasattr(self_client, "embed"):
+                    _orig_embed = self_client.embed
+
+                    @functools.wraps(_orig_embed)
+                    def _sync_embed(*a, **kw):
+                        model = kw.get("model") or "cohere-embedding/unknown"
+                        texts = kw.get("texts", [])
+                        preview = texts[0][:200] if texts else ""
+                        if _DRY_RUN:
+                            p = sum(len(t) for t in texts) // 4
+                            _record("cohere", model, p, 0, str(preview))
+                            return _mock_embed_response(model, p)
+                        resp = _orig_embed(*a, **kw)
+                        p = sum(len(t) for t in texts) // 4
+                        _record("cohere", model, p, 0, str(preview))
+                        return resp
+
+                    self_client.embed = _sync_embed
+
+            except (AttributeError, TypeError):
+                pass
+
+        CohereClient.__init__ = _patched_init
+        _patched["cohere"] = True
+
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+
+# ── patch_all ─────────────────────────────────────────────────────────────────────
+
 def patch_all():
     patch_openai()
     patch_anthropic()
     patch_groq()
+    patch_gemini()
+    patch_mistral()
+    patch_cohere()
 
 def get_patch_status() -> dict:
     return dict(_patched)
