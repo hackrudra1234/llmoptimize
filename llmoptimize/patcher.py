@@ -87,12 +87,14 @@ def _calculate_cost(model: str, prompt_tokens: int, completion_tokens: int = 0) 
 # ── Local session (replaces server.core.magic when server not available) ──────
 
 class _CallRecord:
-    def __init__(self, provider, model, prompt_tokens, completion_tokens, cost):
+    def __init__(self, provider, model, prompt_tokens, completion_tokens, cost,
+                 prompt_preview=""):
         self.provider          = provider
         self.model             = model
         self.prompt_tokens     = prompt_tokens
         self.completion_tokens = completion_tokens
         self.cost              = cost
+        self.prompt_preview    = prompt_preview
 
 class BudgetExceeded(Exception):
     """Raised when a budget() context manager limit is exceeded."""
@@ -131,7 +133,7 @@ class _LocalSession:
                 f"\u2014 consider compressing older history to cut input costs\n"
             )
 
-        self.calls.append(_CallRecord(provider, model, prompt_tokens, completion_tokens, cost))
+        self.calls.append(_CallRecord(provider, model, prompt_tokens, completion_tokens, cost, prompt_preview))
         self.total_cost += cost
         self.last_call_tokens = total_tokens
 

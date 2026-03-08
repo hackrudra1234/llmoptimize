@@ -58,6 +58,7 @@ from llmoptimize.patcher import (
     disable_dry_run as _disable_dry_run,
     reset_local_session as _reset_local_session,
     _record as _patcher_record,
+    BudgetExceeded,
     StepBudgetExceeded,
 )
 _patch_all()
@@ -400,88 +401,108 @@ def step_budget(max_usd: float, warn_only: bool = False):
     return StepBudgetContext(max_usd, warn_only)
 
 
-def estimate(prompt: str, model: str, output_tokens: int = 100) -> dict:
+def estimate(prompt: str, model=None, models: list = None, output_tokens: int = 100) -> dict:
     """
-    Pre-call cost estimate for a prompt + model combo (no real API call).
+    Offline cost estimate — no server call, no API key needed.
 
-    Uses the server pricing database (60+ models). Falls back to local
-    pricing table if the server is unreachable.
-
-    Example::
-
-        result = llmoptimize.estimate("Summarise this report...", "gpt-4")
+    Single model:
+        result = llmoptimize.estimate("Summarise this...", "gpt-4")
         # result["estimated_cost_usd"] -> 0.0042
-        # result["input_tokens"]       -> 140
+
+    Multiple models (replaces compare()):
+        result = llmoptimize.estimate("Summarise this...", models=["gpt-4", "gpt-4o-mini"])
+        # result["rankings"] -> [{model, cost_usd, savings_pct}, ...]
+
+    Uses the local pricing table (30+ models). Works fully offline.
     """
-    return _http_post("/api/estimate", {
-        "prompt":        prompt[:500],
-        "model":         model,
+    from llmoptimize.patcher import _MODEL_COSTS, _calculate_cost
+
+    input_tokens = max(1, len(prompt) // 4)
+
+    # Resolve model list
+    model_list = []
+    if models:
+        model_list = list(models)
+    elif model:
+        model_list = [model]
+    else:
+        return {"success": False, "error": "Provide model= or models="}
+
+    results = []
+    for m in model_list:
+        pricing = _MODEL_COSTS.get(m, {"input": 0.001, "output": 0.002})
+        cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1000
+        results.append({
+            "model": m,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "input_cost_per_1k": pricing["input"],
+            "output_cost_per_1k": pricing["output"],
+            "estimated_cost_usd": round(cost, 8),
+        })
+
+    # Single model — flat result
+    if len(results) == 1:
+        r = results[0]
+        r["success"] = True
+        return r
+
+    # Multiple models — ranked cheapest first
+    results.sort(key=lambda x: x["estimated_cost_usd"])
+    max_cost = results[-1]["estimated_cost_usd"] if results else 1
+    for r in results:
+        r["savings_pct"] = int((1 - r["estimated_cost_usd"] / max_cost) * 100) if max_cost else 0
+
+    return {
+        "success": True,
+        "input_tokens": input_tokens,
         "output_tokens": output_tokens,
-    })
+        "rankings": results,
+    }
 
 
-def compare(
-    prompt: str,
-    models: list,
-    output_tokens: int = 100,
-    sort_by: str = "cost",
-) -> dict:
+
+
+def agent(
+    max_usd: float = None,
+    step_limit: float = None,
+    warn_only: bool = False,
+    max_steps: int = 50,
+    silent: bool = False,
+):
     """
-    Compare the cost of a prompt across multiple models (no real API calls).
+    Unified agent pipeline monitor — one context manager for everything.
 
-    sort_by="cost"  (default) — cheapest-first, pure pricing.
-    sort_by="value" — best cost-per-quality-tier first; rewards models that
-                      are both cheaper AND more capable.
-
-    Each ranking item includes:
-      model, cost_usd, savings_vs_most_expensive_pct, quality_tier (1-4),
-      value_score (cost / quality_tier — lower is better).
-    When sort_by="value", also includes value_savings_vs_worst_pct.
+    Bundles: budget cap, per-step cap, loop detection, step classification,
+    context growth alerts, framework detection, cost projection.
+    All offline — no server calls, no API key needed.
 
     Example::
 
-        result = llmoptimize.compare(
-            "Classify this support ticket as urgent or normal.",
-            models=["gpt-4", "gpt-4o", "gpt-4o-mini", "claude-3-haiku"],
-            sort_by="value",
-        )
-        # result["rankings"][0]["model"]         -> "gpt-4o-mini"
-        # result["rankings"][0]["quality_tier"]  -> 2
-        # result["rankings"][0]["value_score"]   -> 0.000075
+        with llmoptimize.agent(max_usd=0.50, step_limit=0.02):
+            crew.kickoff()
+        # Prints full analysis on exit
+
+    Access stats inside the block::
+
+        with llmoptimize.agent(max_usd=1.00) as a:
+            client.chat.completions.create(...)
+            print(a.spent, a.steps, a.remaining)
     """
-    if not isinstance(models, list):
-        models = list(models)
-    return _http_post("/api/compare", {
-        "prompt":        prompt[:500],
-        "models":        models,
-        "output_tokens": output_tokens,
-        "sort_by":       sort_by,
-    })
+    from llmoptimize.agent import AgentContext
+    return AgentContext(
+        max_usd=max_usd,
+        step_limit=step_limit,
+        warn_only=warn_only,
+        max_steps=max_steps,
+        silent=silent,
+    )
 
-
-
-
-def classify_step(prompt: str) -> dict:
-    """
-    Classify an agent step from its prompt and get a model recommendation.
-
-    Sends the prompt preview to the server which classifies it as one of:
-    planning, reflection, synthesis, tool_call, parsing, formatting, verification,
-    or reasoning (default).
-
-    Returns the step_type and the cheapest model recommended for that step type.
-
-    Example::
-
-        result = llmoptimize.classify_step("Search the web for Python tutorials")
-        # {"step_type": "tool_call", "recommended_model": "gpt-4o-mini", ...}
-    """
-    return _http_post("/api/classify-step", {"prompt": prompt[:500]})
 
 __all__ = [
     "report", "track", "task", "new_session",
     "select_model", "check_loop", "analyze", "rag",
-    "budget", "step_budget", "estimate", "compare", "classify_step",
-    "StepBudgetExceeded",
+    "budget", "step_budget", "estimate", "agent",
+    "BudgetExceeded", "StepBudgetExceeded",
     "__version__", "SESSION_ID", "RUN_ID", "SERVER_URL",
 ]
