@@ -80,6 +80,9 @@ class _CallRecord:
 class BudgetExceeded(Exception):
     """Raised when a budget() context manager limit is exceeded."""
 
+class StepBudgetExceeded(Exception):
+    """Raised when a single API call exceeds the step_budget() limit."""
+
 
 class _LocalSession:
     def __init__(self):
@@ -87,12 +90,35 @@ class _LocalSession:
         self.total_cost: float = 0.0
         self._budget_limit: float = None
         self._budget_baseline: float = 0.0
+        self._step_limit: float = None
+        self.last_call_tokens: int = 0
 
     def record_call(self, provider, model, prompt_tokens, completion_tokens,
                     duration_ms=0, caller_frame=None, prompt_preview=""):
         cost = _calculate_cost(model, prompt_tokens, completion_tokens)
+        total_tokens = prompt_tokens + completion_tokens
+
+        # Per-step budget check (single call cost)
+        if self._step_limit is not None and cost > self._step_limit:
+            raise StepBudgetExceeded(
+                f"Single call cost ${cost:.6f} exceeded step limit ${self._step_limit:.6f} "
+                f"({model}, {prompt_tokens}+{completion_tokens} tokens)"
+            )
+
+        # Context growth alert: warn if tokens grew >2x since last call
+        if self.last_call_tokens > 50 and total_tokens > self.last_call_tokens * 2:
+            print(
+                f"\n[llmoptimize] Context growth alert: "
+                f"{self.last_call_tokens:,} \u2192 {total_tokens:,} tokens "
+                f"({total_tokens / self.last_call_tokens:.1f}\u00d7 growth) "
+                f"\u2014 consider compressing older history to cut input costs\n"
+            )
+
         self.calls.append(_CallRecord(provider, model, prompt_tokens, completion_tokens, cost))
         self.total_cost += cost
+        self.last_call_tokens = total_tokens
+
+        # Cumulative budget check
         if self._budget_limit is not None:
             spent = self.total_cost - self._budget_baseline
             if spent > self._budget_limit:
@@ -102,17 +128,26 @@ class _LocalSession:
                 )
 
     def set_budget(self, limit: float) -> None:
-        """Activate a spend limit. Called by BudgetContext.__enter__."""
+        """Activate a cumulative spend limit. Called by BudgetContext.__enter__."""
         self._budget_limit    = limit
         self._budget_baseline = self.total_cost
 
     def clear_budget(self) -> None:
-        """Deactivate the spend limit. Called by BudgetContext.__exit__."""
+        """Deactivate the cumulative spend limit. Called by BudgetContext.__exit__."""
         self._budget_limit = None
+
+    def set_step_budget(self, limit: float) -> None:
+        """Activate a per-call spend limit. Called by StepBudgetContext.__enter__."""
+        self._step_limit = limit
+
+    def clear_step_budget(self) -> None:
+        """Deactivate the per-call spend limit. Called by StepBudgetContext.__exit__."""
+        self._step_limit = None
 
     def reset(self):
         self.calls = []
         self.total_cost = 0.0
+        self.last_call_tokens = 0
 
 _session = _LocalSession()
 
@@ -211,6 +246,44 @@ def _anthropic_tokens(resp) -> Tuple[int, int]:
         return 0, 0
 
 
+# ── Agent framework detection ─────────────────────────────────────────────────
+
+# Known agent framework module path fragments
+_FRAMEWORK_SIGNATURES = {
+    "langchain":   "langchain",
+    "crewai":      "crewai",
+    "autogen":     "autogen",
+    "llama_index": "llama_index",
+    "haystack":    "haystack",
+    "agentops":    "agentops",
+    "smolagents":  "smolagents",
+    "pydantic_ai": "pydantic_ai",
+}
+
+_detected_framework: str = None  # cached after first detection
+
+
+def _detect_framework() -> str:
+    """Walk the Python call stack to identify the agent framework in use."""
+    global _detected_framework
+    if _detected_framework:
+        return _detected_framework
+    try:
+        import sys
+        frame = sys._getframe(2)   # start above _detect_framework + _record
+        while frame is not None:
+            filename = frame.f_code.co_filename.replace("\\", "/").lower()
+            for key, name in _FRAMEWORK_SIGNATURES.items():
+                if f"/{key}/" in filename or f"\\{key}\\" in filename:
+                    _detected_framework = name
+                    print(f"\n[llmoptimize] Agent framework detected: {name}\n")
+                    return name
+            frame = frame.f_back
+    except Exception:
+        pass
+    return "unknown"
+
+
 def _record(provider, model, prompt_tokens, completion_tokens, prompt_preview=""):
     _session.record_call(provider=provider, model=model,
                           prompt_tokens=prompt_tokens,
@@ -236,6 +309,7 @@ def _record(provider, model, prompt_tokens, completion_tokens, prompt_preview=""
         except Exception:
             _sid = _MODULE_SESSION_ID
             _ver = "unknown"
+        _framework = _detect_framework()
         _payload = _json.dumps({
             "model":             model,
             "prompt_tokens":     prompt_tokens,
@@ -244,6 +318,7 @@ def _record(provider, model, prompt_tokens, completion_tokens, prompt_preview=""
             "provider":          provider,
             "prompt_preview":    prompt_preview[:100],
             "sdk_version":       _ver,
+            "agent_framework":   _framework,
         }).encode("utf-8")
         _req = urllib.request.Request(
             f"{_server}/track",

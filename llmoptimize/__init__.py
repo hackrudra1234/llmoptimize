@@ -58,6 +58,7 @@ from llmoptimize.patcher import (
     disable_dry_run as _disable_dry_run,
     reset_local_session as _reset_local_session,
     _record as _patcher_record,
+    StepBudgetExceeded,
 )
 _patch_all()
 
@@ -356,7 +357,7 @@ def analyze(prompt: str, model: str) -> dict:
 
 def budget(max_usd: float, warn_only: bool = False):
     """
-    Context manager that enforces a spend limit on patched AI API calls.
+    Context manager that enforces a cumulative spend limit on patched AI API calls.
 
     Raises BudgetExceeded (or prints a warning if warn_only=True) as soon as
     accumulated spend within the block exceeds max_usd.
@@ -374,6 +375,29 @@ def budget(max_usd: float, warn_only: bool = False):
     """
     from llmoptimize.budget import BudgetContext
     return BudgetContext(max_usd, warn_only)
+
+
+def step_budget(max_usd: float, warn_only: bool = False):
+    """
+    Context manager that enforces a per-call spend limit on patched AI API calls.
+
+    Raises StepBudgetExceeded (or prints a warning if warn_only=True) if any
+    single API call within the block costs more than max_usd.  Ideal for agent
+    workflows where you want to cap the cost of individual reasoning or tool
+    steps independently of total session spend.
+
+    Example::
+
+        with llmoptimize.step_budget(max_usd=0.005):
+            # Each call must cost less than half a cent
+            client.chat.completions.create(model="gpt-4o", ...)
+
+        # warn instead of raising:
+        with llmoptimize.step_budget(max_usd=0.005, warn_only=True):
+            ...
+    """
+    from llmoptimize.budget import StepBudgetContext
+    return StepBudgetContext(max_usd, warn_only)
 
 
 def estimate(prompt: str, model: str, output_tokens: int = 100) -> dict:
@@ -435,9 +459,29 @@ def compare(
     })
 
 
+
+
+def classify_step(prompt: str) -> dict:
+    """
+    Classify an agent step from its prompt and get a model recommendation.
+
+    Sends the prompt preview to the server which classifies it as one of:
+    planning, reflection, synthesis, tool_call, parsing, formatting, verification,
+    or reasoning (default).
+
+    Returns the step_type and the cheapest model recommended for that step type.
+
+    Example::
+
+        result = llmoptimize.classify_step("Search the web for Python tutorials")
+        # {"step_type": "tool_call", "recommended_model": "gpt-4o-mini", ...}
+    """
+    return _http_post("/api/classify-step", {"prompt": prompt[:500]})
+
 __all__ = [
     "report", "track", "task", "new_session",
     "select_model", "check_loop", "analyze", "rag",
-    "budget", "estimate", "compare",
+    "budget", "step_budget", "estimate", "compare", "classify_step",
+    "StepBudgetExceeded",
     "__version__", "SESSION_ID", "RUN_ID", "SERVER_URL",
 ]

@@ -1,26 +1,29 @@
 """
-llmoptimize/budget.py — spend guardrail context manager.
+llmoptimize/budget.py — spend guardrail context managers.
 
 Usage::
 
-    # Raise BudgetExceeded if any patched API call pushes spend over $0.10:
+    # Raise BudgetExceeded if cumulative spend exceeds $0.10:
     with llmoptimize.budget(max_usd=0.10):
+        client.chat.completions.create(...)
+
+    # Raise StepBudgetExceeded if a single call exceeds $0.005:
+    with llmoptimize.step_budget(max_usd=0.005):
         client.chat.completions.create(...)
 
     # Warn only (no exception):
     with llmoptimize.budget(max_usd=0.10, warn_only=True):
         client.chat.completions.create(...)
-
-The check is real-time: BudgetExceeded is raised inside the API call that
-pushes spend over the limit, not just on context exit.
 """
 
-from llmoptimize.patcher import BudgetExceeded, get_local_session  # noqa: F401
+from llmoptimize.patcher import (
+    BudgetExceeded, StepBudgetExceeded, get_local_session,
+)  # noqa: F401
 
 
 class BudgetContext:
     """
-    Context manager that enforces a per-session spend limit.
+    Context manager that enforces a per-session cumulative spend limit.
 
     Tracks only the calls made *within* this context block (uses a cost
     baseline so pre-existing session spend is excluded).
@@ -79,3 +82,46 @@ class BudgetContext:
     def remaining(self) -> float:
         """Remaining budget."""
         return max(0.0, self.max_usd - self.spent)
+
+
+class StepBudgetContext:
+    """
+    Context manager that enforces a per-call spend limit.
+
+    Raises StepBudgetExceeded (or prints a warning) if any single API call
+    within the block exceeds max_usd.  Useful for agent workflows where you
+    want to cap the cost of individual reasoning/tool steps.
+
+    Args:
+        max_usd:   Maximum allowed cost per API call in USD.
+        warn_only: If True, print a warning instead of raising StepBudgetExceeded.
+
+    Example::
+
+        with llmoptimize.step_budget(max_usd=0.01):
+            # Each individual call must cost less than $0.01
+            client.chat.completions.create(model="gpt-4o", ...)
+    """
+
+    def __init__(self, max_usd: float, warn_only: bool = False):
+        if max_usd <= 0:
+            raise ValueError("max_usd must be positive")
+        self.max_usd   = max_usd
+        self.warn_only = warn_only
+
+    def __enter__(self):
+        get_local_session().set_step_budget(self.max_usd)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        get_local_session().clear_step_budget()
+
+        if exc_type is StepBudgetExceeded:
+            if self.warn_only:
+                print(
+                    f"\n[llmoptimize] Step budget warning: {exc_val}\n"
+                )
+                return True   # suppress the exception
+            return False      # re-raise
+
+        return False
