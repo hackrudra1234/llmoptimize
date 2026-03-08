@@ -1,9 +1,5 @@
 """
-setup.py for LLMOptimize v3.2.3
-
-FIXES vs previous version:
-  1. Fixed animation artifacts in non-TTY environments (CI, pipes, Windows terminals)
-  2. Fixed server startup crash: AIAuditor no longer accepts enable_ai kwarg
+setup.py for LLMOptimize v3.4.0
 """
 
 from setuptools import setup, find_packages
@@ -13,7 +9,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="llmoptimize",
-    version="3.2.3",
+    version="3.4.0",
     author="LLMOptimize Team",
     author_email="hackrudra@gmail.com",
     description="Reduce LLM costs by 90% - AI recommendations with NO API keys needed!",
