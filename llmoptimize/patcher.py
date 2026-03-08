@@ -422,7 +422,7 @@ def _record(provider, model, prompt_tokens, completion_tokens, prompt_preview=""
             "completion_tokens": completion_tokens,
             "session_id":        _sid,
             "provider":          provider,
-            "prompt_preview":    _redact_preview(prompt_preview[:100]),
+            "prompt_preview":    _redact_preview(prompt_preview[:200]),
             "sdk_version":       _ver,
             "agent_framework":   _framework,
         }).encode("utf-8")
